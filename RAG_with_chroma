@@ -6,23 +6,20 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from PyPDF2 import PdfReader
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from chromadb.errors import ChromaError
-from chromadb.config import Settings
-import chromadb
-import pytesseract
-from PIL import Image
-from uuid import uuid4
+from transformers import pipeline
+from langchain.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFacePipeline
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-import numpy as np
+from PIL import Image as PILImage
+import pytesseract
 
 # Load environment variables
 load_dotenv()
@@ -39,15 +36,23 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(STATIC_FOLDER, exist_ok=True)
 
-# Initialize Chroma client
-chroma_client = chromadb.PersistentClient("chroma_db")
+# Initialize Chroma and embedding model
+PERSIST_DIRECTORY = "./chroma_db"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 
-chroma_collection = chroma_client.get_or_create_collection(name="file_chunks")
-print("Chroma collection initialized.")
+vector_store = Chroma(
+    persist_directory=PERSIST_DIRECTORY,
+    embedding_function=embedding_model
+)
 
-# Initialize LangChain components
-retriever = Chroma(collection_name="file_chunks", client=chroma_client)
-llm = HuggingFacePipeline.from_model_id("distilgpt2", task="text-generation")
+# Initialize HuggingFace LLM pipeline
+LLM_MODEL_NAME = "gpt2"  # Replace with your desired HuggingFace model
+llm_pipeline = pipeline("text-generation", model=LLM_MODEL_NAME, max_length=512, temperature=0.5)
+llm = HuggingFacePipeline(pipeline=llm_pipeline)
+
+retriever = vector_store.as_retriever()
+qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
 # Utility functions
 def allowed_file(filename):
@@ -55,7 +60,7 @@ def allowed_file(filename):
 
 def extract_text_from_image(file_path):
     try:
-        image = Image.open(file_path)
+        image = PILImage.open(file_path)
         text = pytesseract.image_to_string(image)
         return text.strip() or "No text could be extracted from the image."
     except Exception as e:
@@ -69,13 +74,6 @@ def extract_text_from_pdf(file_path):
         return f"Error extracting text from PDF: {str(e)}"
 
 def chunk_text_and_store(text, source_name):
-    """
-    Splits text into chunks and stores them in the Chroma vector store.
-    """
-    if not text.strip():
-        print(f"Warning: Text from {source_name} is empty or whitespace only.")
-        return []
-
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_text(text)
     if not chunks:
@@ -84,7 +82,7 @@ def chunk_text_and_store(text, source_name):
 
     documents = [{"content": chunk, "metadata": {"source": source_name}} for chunk in chunks]
     try:
-        retriever.add_texts(
+        vector_store.add_texts(
             texts=[doc["content"] for doc in documents],
             metadatas=[doc["metadata"] for doc in documents]
         )
@@ -93,60 +91,139 @@ def chunk_text_and_store(text, source_name):
     return chunks
 
 def retrieve_relevant_chunks(prompt):
-    """
-    Retrieves relevant chunks for the given prompt from Chroma.
-    """
     try:
-        qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
-        response = qa.run(prompt)
+        response = qa_chain.run(prompt)
         return response
     except Exception as e:
         print(f"Error during retrieval: {e}")
         return "No relevant information could be retrieved."
 
-def generate_pdf(prompt, combined_responses, combined_df):
-    pdf_path = os.path.join(STATIC_FOLDER, "output_report.pdf")
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import os
+import matplotlib.pyplot as plt
+
+def generate_detailed_pdf(prompt, combined_responses, file_summaries, df):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as ReportLabImage
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    import os
+    import matplotlib.pyplot as plt
+
+    pdf_path = os.path.join(STATIC_FOLDER, 'detailed_report.pdf')
     doc = SimpleDocTemplate(pdf_path, pagesize=letter)
     styles = getSampleStyleSheet()
-    content = []
+
+    # Custom styles
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Title'],
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        spaceAfter=12
+    )
+    heading_style = ParagraphStyle(
+        'HeadingStyle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=14,
+        spaceAfter=10
+    )
+    body_style = ParagraphStyle(
+        'BodyStyle',
+        parent=styles['BodyText'],
+        fontName='Helvetica',
+        fontSize=11,
+        leading=14,
+        spaceAfter=8
+    )
+    table_style = TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+    ])
+
+    elements = []
 
     # Title
-    content.append(Paragraph("AI Generated Report", styles["Title"]))
-    content.append(Spacer(1, 12))
+    elements.append(Paragraph("AI-Generated Research Paper Report", title_style))
+    elements.append(Spacer(1, 12))
 
     # Introduction
-    content.append(Paragraph("<b>Introduction:</b>", styles["Heading2"]))
-    content.append(Paragraph(
-        f"This report was generated based on the prompt: '{prompt}'. It analyzes the input data and summarizes key findings using AI techniques.",
-        styles["BodyText"]
+    elements.append(Paragraph("Introduction", heading_style))
+    elements.append(Paragraph(
+        f"This report was generated based on the prompt: '{prompt}'. It provides a comprehensive overview of key findings, combining insights from multiple sources and highlighting relevant case studies and examples.",
+        body_style
     ))
-    content.append(Spacer(1, 12))
+    elements.append(Spacer(1, 12))
 
-    # Findings
-    content.append(Paragraph("<b>Findings:</b>", styles["Heading2"]))
-    content.append(Paragraph(combined_responses, styles["BodyText"]))
-    content.append(Spacer(1, 12))
+    # Literature Review
+    elements.append(Paragraph("Literature Review", heading_style))
+    for summary in file_summaries:
+        elements.append(Paragraph(summary, body_style))
+    elements.append(Spacer(1, 12))
+
+    # Detailed Findings
+    elements.append(Paragraph("Detailed Findings", heading_style))
+    for response in combined_responses:
+        elements.append(Paragraph(response, body_style))
+        elements.append(Spacer(1, 8))
+
+    # Discussion
+    elements.append(Paragraph("Discussion", heading_style))
+    elements.append(Paragraph(
+        "This section critically analyzes the findings, explores challenges in the domain, and identifies potential future directions to advance the field.",
+        body_style
+    ))
+    elements.append(Spacer(1, 12))
 
     # Conclusion
-    content.append(Paragraph("<b>Conclusion:</b>", styles["Heading2"]))
-    content.append(Paragraph(
-        "This report highlights key insights from the data, aiding in decision-making.",
-        styles["BodyText"]
+    elements.append(Paragraph("Conclusion", heading_style))
+    elements.append(Paragraph(
+        "Based on the insights provided, this report recommends actionable steps and highlights key implications for researchers and practitioners.",
+        body_style
     ))
-    content.append(Spacer(1, 12))
+    elements.append(Spacer(1, 12))
 
-    # Visualization
-    if not combined_df.empty:
-        plt.figure(figsize=(4, 4))
-        combined_df.select_dtypes(include=[np.number]).iloc[:, :2].plot(kind="bar", legend=False)
-        plt.tight_layout()
-        plt.savefig(os.path.join(STATIC_FOLDER, "plot.png"))
-        plt.close()
-        content.append(Paragraph("<b>Visualization:</b>", styles["Heading2"]))
-        content.append(Image(os.path.join(STATIC_FOLDER, "plot.png"), width=400, height=300))
-        content.append(Spacer(1, 12))
+    # Data Visualization
+    if not df.empty:
+        numeric_df = df.select_dtypes(include=['number'])
+        if not numeric_df.empty:
+            try:
+                plot_path = os.path.join(STATIC_FOLDER, 'plot.png')
+                numeric_df.plot(kind='bar', figsize=(8, 6))
+                plt.title("Bar Plot of Numeric Data")
+                plt.xticks(rotation=45, ha='right')
+                plt.tight_layout()
+                plt.savefig(plot_path)
+                plt.close()
 
-    doc.build(content)
+                elements.append(Paragraph("Data Visualization", heading_style))
+                elements.append(Paragraph("Bar Plot of Numeric Data:", body_style))
+                elements.append(ReportLabImage(plot_path, width=400, height=300))
+                elements.append(Spacer(1, 12))
+            except Exception as e:
+                print(f"Error creating bar plot: {e}")
+
+    # Include Tables (if applicable)
+    if not df.empty:
+        try:
+            table_data = [list(df.columns)] + df.values.tolist()
+            table = Table(table_data)
+            table.setStyle(table_style)
+            elements.append(Paragraph("Tabular Summary", heading_style))
+            elements.append(table)
+            elements.append(Spacer(1, 12))
+        except Exception as e:
+            print(f"Error creating table: {e}")
+
+    doc.build(elements)
     return pdf_path
 
 @app.route('/preview', methods=['POST'])
@@ -157,6 +234,7 @@ def preview_report():
     files = request.files.getlist('files')
     prompt = request.form.get('prompt', '')
     combined_responses = []
+    file_summaries = []
     dfs = []
 
     for file in files:
@@ -184,6 +262,9 @@ def preview_report():
                     with open(file_path, "r", encoding="utf-8") as f:
                         file_content = f.read()
 
+                file_summary = f"<b>{filename}:</b> {file_content[:500]}..."
+                file_summaries.append(file_summary)
+
                 chunks = chunk_text_and_store(file_content, filename)
                 response = retrieve_relevant_chunks(prompt)
                 combined_responses.append(f"--- Insights from {filename} ---\n{response}")
@@ -196,8 +277,9 @@ def preview_report():
 
     try:
         combined_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        pdf_path = generate_pdf(prompt, "\n".join(combined_responses), combined_df)
+        pdf_path = generate_detailed_pdf(prompt, combined_responses, file_summaries, combined_df)
         return jsonify({"preview_url": f"/static/{os.path.basename(pdf_path)}"})
+
     except Exception as e:
         return jsonify({"error": f"Error generating PDF: {str(e)}"}), 500
 

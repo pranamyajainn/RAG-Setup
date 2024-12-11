@@ -1,0 +1,213 @@
+import os
+import json
+import pandas as pd
+from flask import Flask, request, jsonify, render_template, send_file
+from flask_cors import CORS
+from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from PyPDF2 import PdfReader
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from chromadb.errors import ChromaError
+from chromadb.config import Settings
+import chromadb
+import pytesseract
+from PIL import Image
+from uuid import uuid4
+from langchain.chains import RetrievalQA
+from langchain.llms import HuggingFacePipeline
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+import numpy as np
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+
+# Configuration for file uploads
+UPLOAD_FOLDER = 'uploads'
+STATIC_FOLDER = 'static'
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'csv', 'xlsx', 'json', 'jpg', 'jpeg', 'png'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(STATIC_FOLDER, exist_ok=True)
+
+# Initialize Chroma client
+chroma_client = chromadb.PersistentClient("chroma_db")
+
+chroma_collection = chroma_client.get_or_create_collection(name="file_chunks")
+print("Chroma collection initialized.")
+
+# Initialize LangChain components
+retriever = Chroma(collection_name="file_chunks", client=chroma_client)
+llm = HuggingFacePipeline.from_model_id("distilgpt2", task="text-generation")
+
+# Utility functions
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def extract_text_from_image(file_path):
+    try:
+        image = Image.open(file_path)
+        text = pytesseract.image_to_string(image)
+        return text.strip() or "No text could be extracted from the image."
+    except Exception as e:
+        return f"Error extracting text from image: {str(e)}"
+
+def extract_text_from_pdf(file_path):
+    try:
+        reader = PdfReader(file_path)
+        return ''.join(page.extract_text() for page in reader.pages)
+    except Exception as e:
+        return f"Error extracting text from PDF: {str(e)}"
+
+def chunk_text_and_store(text, source_name):
+    """
+    Splits text into chunks and stores them in the Chroma vector store.
+    """
+    if not text.strip():
+        print(f"Warning: Text from {source_name} is empty or whitespace only.")
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_text(text)
+    if not chunks:
+        print(f"Warning: No chunks generated from {source_name}.")
+        return []
+
+    documents = [{"content": chunk, "metadata": {"source": source_name}} for chunk in chunks]
+    try:
+        retriever.add_texts(
+            texts=[doc["content"] for doc in documents],
+            metadatas=[doc["metadata"] for doc in documents]
+        )
+    except Exception as e:
+        print(f"Error adding chunks to Chroma for {source_name}: {e}")
+    return chunks
+
+def retrieve_relevant_chunks(prompt):
+    """
+    Retrieves relevant chunks for the given prompt from Chroma.
+    """
+    try:
+        qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
+        response = qa.run(prompt)
+        return response
+    except Exception as e:
+        print(f"Error during retrieval: {e}")
+        return "No relevant information could be retrieved."
+
+def generate_pdf(prompt, combined_responses, combined_df):
+    pdf_path = os.path.join(STATIC_FOLDER, "output_report.pdf")
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    content = []
+
+    # Title
+    content.append(Paragraph("AI Generated Report", styles["Title"]))
+    content.append(Spacer(1, 12))
+
+    # Introduction
+    content.append(Paragraph("<b>Introduction:</b>", styles["Heading2"]))
+    content.append(Paragraph(
+        f"This report was generated based on the prompt: '{prompt}'. It analyzes the input data and summarizes key findings using AI techniques.",
+        styles["BodyText"]
+    ))
+    content.append(Spacer(1, 12))
+
+    # Findings
+    content.append(Paragraph("<b>Findings:</b>", styles["Heading2"]))
+    content.append(Paragraph(combined_responses, styles["BodyText"]))
+    content.append(Spacer(1, 12))
+
+    # Conclusion
+    content.append(Paragraph("<b>Conclusion:</b>", styles["Heading2"]))
+    content.append(Paragraph(
+        "This report highlights key insights from the data, aiding in decision-making.",
+        styles["BodyText"]
+    ))
+    content.append(Spacer(1, 12))
+
+    # Visualization
+    if not combined_df.empty:
+        plt.figure(figsize=(4, 4))
+        combined_df.select_dtypes(include=[np.number]).iloc[:, :2].plot(kind="bar", legend=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(STATIC_FOLDER, "plot.png"))
+        plt.close()
+        content.append(Paragraph("<b>Visualization:</b>", styles["Heading2"]))
+        content.append(Image(os.path.join(STATIC_FOLDER, "plot.png"), width=400, height=300))
+        content.append(Spacer(1, 12))
+
+    doc.build(content)
+    return pdf_path
+
+@app.route('/preview', methods=['POST'])
+def preview_report():
+    if 'files' not in request.files or len(request.files.getlist('files')) == 0:
+        return jsonify({"error": "No files uploaded"}), 400
+
+    files = request.files.getlist('files')
+    prompt = request.form.get('prompt', '')
+    combined_responses = []
+    dfs = []
+
+    for file in files:
+        if allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+
+            file_extension = filename.rsplit(".", 1)[1].lower()
+            file_content = ""
+
+            try:
+                if file_extension in {'jpg', 'jpeg', 'png'}:
+                    file_content = extract_text_from_image(file_path)
+                elif file_extension == "pdf":
+                    file_content = extract_text_from_pdf(file_path)
+                elif file_extension in {"csv", "xlsx"}:
+                    df = pd.read_csv(file_path) if file_extension == "csv" else pd.read_excel(file_path)
+                    dfs.append(df)
+                    file_content = df.to_string(index=False)
+                elif file_extension == "json":
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        file_content = json.dumps(json.load(f), indent=4)
+                elif file_extension == "txt":
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        file_content = f.read()
+
+                chunks = chunk_text_and_store(file_content, filename)
+                response = retrieve_relevant_chunks(prompt)
+                combined_responses.append(f"--- Insights from {filename} ---\n{response}")
+
+            except Exception as e:
+                return jsonify({"error": f"Error processing file {filename}: {str(e)}"}), 400
+
+    if not combined_responses:
+        return jsonify({"error": "The uploaded files contain no readable content."}), 400
+
+    try:
+        combined_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        pdf_path = generate_pdf(prompt, "\n".join(combined_responses), combined_df)
+        return jsonify({"preview_url": f"/static/{os.path.basename(pdf_path)}"})
+    except Exception as e:
+        return jsonify({"error": f"Error generating PDF: {str(e)}"}), 500
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_file(os.path.join(STATIC_FOLDER, filename))
+
+@app.route("/")
+def index():
+    return render_template("upload.html")
+
+if __name__ == "__main__":
+    app.run(debug=True)

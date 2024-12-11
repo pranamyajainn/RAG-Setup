@@ -1,3 +1,4 @@
+#PREVIEW MODE ADDED
 import os
 import json
 import pandas as pd
@@ -10,14 +11,13 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
 import matplotlib
-matplotlib.use('Agg')  # Use the Agg backend for matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from PyPDF2 import PdfReader
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, ServiceContext
-import openai
+
 # Load environment variables
 load_dotenv()
 
@@ -27,312 +27,118 @@ CORS(app)
 
 # OpenAI API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Set OpenAI API key
 openai.api_key = OPENAI_API_KEY
 
-# Configure file upload
+# File upload configuration
 UPLOAD_FOLDER = 'uploads'
+STATIC_FOLDER = 'static'
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'csv', 'xlsx', 'json'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32 MB limit
 
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(STATIC_FOLDER, exist_ok=True)
 
-# RAG System with llama_index
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from PyPDF2 import PdfReader
-
-
+# RAG System class
 class RAGSystem:
-    def __init__(self, openai_api_key: str):
-        # Initialize OpenAI client
-        self.client = OpenAI(api_key=openai_api_key)
-
-        # Embedding model
+    def __init__(self):
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-        # Knowledge base
-        self.knowledge_base = [
-            "Machine learning is a subset of artificial intelligence.",
-            "RAG combines retrieval of relevant information with generative AI.",
-            "OpenAI provides powerful language models for various applications.",
-            "Embedding models help convert text into numerical representations.",
-            "Cosine similarity is used to measure the similarity between vectors."
-        ]
-
-        # Precompute embeddings
-        self.knowledge_embeddings = self.embed_documents(self.knowledge_base)
-
-    def embed_documents(self, documents):
-        return self.embedding_model.encode(documents)
-
-    def retrieve_relevant_context(self, query, file_content=None, top_k=2):
-        context = []
-
-        # Prioritize file content if available
-        if file_content:
-            context.append(f"Uploaded File Content: {file_content}")
-
-        # Add query-relevant knowledge base entries
-        query_embedding = self.embedding_model.encode([query])
-        knowledge_similarities = cosine_similarity(query_embedding, self.knowledge_embeddings)[0]
-        top_indices = knowledge_similarities.argsort()[-top_k:][::-1]
-
-        for idx in top_indices:
-            context.append(self.knowledge_base[idx])
-
-        return context
-
-    def generate_response(self, query, context, file_content=None):
-        # Ensure context is a list of strings
-        if isinstance(context, list):
-            context_text = ' '.join(map(str, context))
-        else:
-            context_text = str(context)
-
-        # Add file content to context if available
-        if file_content:
-            context_text += f"\n\nFull File Content: {file_content}"
-
-        prompt = f"""
-        Context: 
-        {context_text}
-
-        Question: {query}
-
-        Provide a direct, concise, and relevant answer based strictly on the given context. 
-        If the context does not contain sufficient information to answer the query, 
-        clearly state that the information is not available in the provided context.
-        """
-
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system",
-                     "content": "You are a helpful assistant that provides precise answers based on the given context."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=300  # Limit response length
-            )
-
-            return response.choices[0].message.content.strip()
-
-        except Exception as e:
-            return f"Error generating response: {str(e)}"
+    def generate_response(self, prompt, context):
+        combined_context = ' '.join(context)
+        response = f"Generated response for prompt: '{prompt}' with context: {combined_context}"
+        return response
 
     def extract_text_from_pdf(self, file_path):
         text = ""
         try:
             reader = PdfReader(file_path)
             for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
-                else:
-                    text += "\n[Warning: Text extraction failed for one or more pages.]"
+                text += page.extract_text()
         except Exception as e:
             text = f"Error extracting text from PDF: {str(e)}"
         return text
 
-    from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, ServiceContext
+rag_system = RAGSystem()
 
-    def create_index_from_files(self, directory_path):
-        try:
-            # Load documents from the directory
-            documents = SimpleDirectoryReader(directory_path).load_data()
-
-            # Create and return vector store index
-            index = VectorStoreIndex.from_documents(documents)
-            return index
-        except Exception as e:
-            print(f"Error creating index: {e}")
-            return None
-
-    def query_index(self, index, query, file_content=None):
-        if index is None:
-            return "No index available"
-
-        try:
-            # Create a query engine
-            query_engine = index.as_query_engine()
-
-            # Perform the query
-            response = query_engine.query(query)
-
-            # Extract response text
-            context = response.response if hasattr(response, 'response') else str(response)
-
-            # Generate a refined response using the context
-            return self.generate_response(query, [context], file_content)
-
-        except Exception as e:
-            return f"Error querying index: {e}"
-rag_system = RAGSystem(OPENAI_API_KEY)
-
-
-# Utility function to check file type
+# Utility function to check allowed file types
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+# PDF generation function
 def generate_pdf(prompt, file_content, response, df):
-    pdf_path = "output_report.pdf"
+    pdf_path = os.path.join(STATIC_FOLDER, "output_report.pdf")
     doc = SimpleDocTemplate(pdf_path, pagesize=letter)
     styles = getSampleStyleSheet()
     content = []
 
-    # Add title
     content.append(Paragraph("AI Generated Report", styles["Title"]))
     content.append(Spacer(1, 12))
-
-    # Add Prompt
     content.append(Paragraph(f"<b>Prompt:</b> {prompt}", styles["BodyText"]))
     content.append(Spacer(1, 12))
-
-    # Add File Content
-    content.append(Paragraph("<b>Uploaded File Content:</b>", styles["BodyText"]))
-    content.append(Spacer(1, 12))
+    content.append(Paragraph("<b>File Content:</b>", styles["BodyText"]))
     content.append(Paragraph(file_content[:2000] + "..." if len(file_content) > 2000 else file_content, styles["BodyText"]))
     content.append(Spacer(1, 12))
+    content.append(Paragraph(f"<b>Response:</b> {response}", styles["BodyText"]))
 
-    # Add AI Response
-    content.append(Paragraph("<b>AI Response:</b>", styles["BodyText"]))
-    content.append(Spacer(1, 12))
-    content.append(Paragraph(response, styles["BodyText"]))
-    content.append(Spacer(1, 12))
-
-    # Add Plot if DataFrame is present and has numeric data
     if not df.empty:
-        numeric_cols = df.select_dtypes(include=[np.number])
-        if not numeric_cols.empty:
-            plt.figure(figsize=(4, 4))
-            numeric_cols.iloc[:, :2].plot(kind="bar", legend=False)  # Assumes first two numeric columns
-            plt.title("Sample Plot from Uploaded File")
-            plt.tight_layout()
-            plt.savefig("plot.png")
-            plt.close()
-            content.append(Image("plot.png", width=400, height=300))
-            content.append(Spacer(1, 12))
-        else:
-            content.append(Paragraph("<b>No numeric data available to plot.</b>", styles["BodyText"]))
-            content.append(Spacer(1, 12))
+        plt.figure(figsize=(4, 4))
+        df.select_dtypes(include=[np.number]).iloc[:, :2].plot(kind="bar", legend=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(STATIC_FOLDER, "plot.png"))
+        plt.close()
+        content.append(Image(os.path.join(STATIC_FOLDER, "plot.png"), width=400, height=300))
 
-    # Build PDF
     doc.build(content)
     return pdf_path
 
-# File upload route
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'files' not in request.files or len(request.files.getlist('files')) == 0:
+# Preview endpoint
+@app.route('/preview', methods=['POST'])
+def preview_report():
+    if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
-    files = request.files.getlist('files')
+    file = request.files['file']
     prompt = request.form.get('prompt', '')
 
-    all_responses = []
-    all_file_contents = []
-    all_dfs = []
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
 
-    for file in files:
-        if file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
+        file_extension = filename.rsplit(".", 1)[1].lower()
+        try:
+            if file_extension == "csv":
+                df = pd.read_csv(file_path)
+            elif file_extension == "xlsx":
+                df = pd.read_excel(file_path)
+            elif file_extension == "json":
+                df = pd.read_json(file_path)
+            elif file_extension == "pdf":
+                text = rag_system.extract_text_from_pdf(file_path)
+                df = pd.DataFrame({"Content": [text]})
+            elif file_extension == "txt":
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                df = pd.DataFrame({"Content": [text]})
+            else:
+                return jsonify({"error": "Unsupported file type"}), 400
+        except Exception as e:
+            return jsonify({"error": f"Error reading file: {str(e)}"}), 400
 
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(file_path)
+        file_content = df.to_string(index=False) if not df.empty else ""
+        response = rag_system.generate_response(prompt, [file_content])
 
-            # Process file content
-            file_extension = filename.rsplit(".", 1)[1].lower()
-            try:
-                # Standardize file reading to ensure we always have a DataFrame
-                if file_extension == "csv":
-                    df = pd.read_csv(file_path)
-                elif file_extension == "xlsx":
-                    df = pd.read_excel(file_path)
-                elif file_extension == "json":
-                    df = pd.read_json(file_path)
-                elif file_extension == "pdf":
-                    text = rag_system.extract_text_from_pdf(file_path)
-                    if "Error extracting text" in text:
-                        return jsonify({"error": text}), 400
-                    df = pd.DataFrame({"Content": [text]})
-                elif file_extension == "txt":
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        text = f.read()
-                    df = pd.DataFrame({"Content": [text]})
-                else:
-                    return jsonify({"error": "Unsupported file type"}), 400
+        pdf_path = generate_pdf(prompt, file_content, response, df)
+        return jsonify({"preview_url": f"/static/{os.path.basename(pdf_path)}"})
+    else:
+        return jsonify({"error": "Invalid file type"}), 400
 
-            except Exception as e:
-                return jsonify({"error": f"Error reading file: {str(e)}"}), 400
+# Serve static files
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_file(os.path.join(STATIC_FOLDER, filename))
 
-            # Improved file content extraction
-            file_content = ""
-            if not df.empty:
-                # Try to convert entire DataFrame to a readable string
-                try:
-                    file_content = df.to_string(index=False)
-                except Exception:
-                    # Fallback to converting first few rows
-                    try:
-                        file_content = df.head().to_string(index=False)
-                    except Exception as e:
-                        file_content = f"Error converting file content: {str(e)}"
-
-            # Debug print to verify file content
-            print("File Content:", file_content[:500])  # Print first 500 characters
-
-            # Create index from the specific file
-            temp_upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], filename.split('.')[0])
-            os.makedirs(temp_upload_dir, exist_ok=True)
-            file_path_in_temp = os.path.join(temp_upload_dir, filename)
-
-            # Copy the file to the temporary directory
-            import shutil
-            shutil.copy(file_path, file_path_in_temp)
-
-            # Create index from the specific file
-            try:
-                index = rag_system.create_index_from_files(temp_upload_dir)
-            except Exception as e:
-                print(f"Error creating index: {e}")
-                index = None
-
-            # Generate response
-            try:
-                # If index creation failed, fall back to direct context
-                if index is None:
-                    context = file_content
-                    response = rag_system.generate_response(prompt, [context], file_content)
-                else:
-                    # Try to query the index first
-                    context = rag_system.query_index(index, prompt, file_content)
-                    response = rag_system.generate_response(prompt, [context], file_content)
-            except Exception as e:
-                response = f"Error generating response: {str(e)}"
-
-            # Clean up temporary directory
-            shutil.rmtree(temp_upload_dir, ignore_errors=True)
-
-            # Append results
-            all_responses.append(response)
-            all_file_contents.append(file_content)
-            all_dfs.append(df)
-
-    # Generate and return a single PDF for all files
-    try:
-        pdf_path = generate_pdf(prompt, "\n".join(all_file_contents), "\n".join(all_responses),
-                                pd.concat(all_dfs, ignore_index=True))
-        return send_file(pdf_path, as_attachment=True, download_name='report.pdf')
-    except Exception as e:
-        return jsonify({"error": f"Error generating PDF: {str(e)}"}), 500
 @app.route("/")
 def index():
     return render_template("upload.html")

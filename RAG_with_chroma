@@ -47,7 +47,7 @@ vector_store = Chroma(
 )
 
 # Initialize HuggingFace LLM pipeline
-LLM_MODEL_NAME = "gpt2"  # Replace with your desired HuggingFace model
+LLM_MODEL_NAME = "EleutherAI/gpt-neo"  # Replace with your desired HuggingFace model
 llm_pipeline = pipeline("text-generation", model=LLM_MODEL_NAME, max_length=512, temperature=0.5)
 llm = HuggingFacePipeline(pipeline=llm_pipeline)
 

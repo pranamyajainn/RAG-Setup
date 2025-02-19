@@ -37,7 +37,7 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB limit
 # Ensure required directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Utility function: Check allowed file extensions
+# Utility function: Check allowed file extension
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 

@@ -21,7 +21,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from PIL import Image as PILImage
 import pytesseract
 
-# Load environment variables
+# Load environment 
 load_dotenv()
 
 # Initialize Flask app
